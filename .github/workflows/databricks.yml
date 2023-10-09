@@ -1,0 +1,232 @@
+name: Databricks Deploy
+on:
+  pull_request:
+    branches: 
+    - dev
+    - qa
+    - uat
+    - prod
+    - qa-ds
+    - uat-ds
+    - prod-ds  
+    types: [opened, closed]
+  workflow_dispatch:
+    inputs:
+      UserComment:
+        required: false
+        description: (Optional) User Functional Comments
+        default: ''
+      validation_parameter:
+        description: '(Optional) Validation Task Parameter Name'
+        required: false
+        default: ''     
+        
+jobs:
+
+  prevalidation_stonebranch_task:
+    runs-on: ubuntu-20.04
+    environment: Validation_Task
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.state != 'closed')  
+    env:
+      valtype: 'pre'
+      valtarget: ${{ github.event_name == 'workflow_dispatch' &&   github.ref_name  || github.base_ref }}
+    steps:      
+      - name: Input Parameters
+        run: |
+           echo '${{ toJSON(github.event.inputs) }}'
+           validation_parameter="${{ github.event.inputs.validation_parameter }}"
+           if [  "$validation_parameter" = "" ]
+           then
+               validation_parameter=$(echo "${{ github.event.pull_request.body }}" | python3 -c "import sys, json; str=sys.stdin.read(); print(str.split('%%')[1]) if '%%' in str else print('') " )
+           fi
+           echo "validation_parameter=$validation_parameter"
+           echo "validation_parameter=$validation_parameter" >> $GITHUB_ENV
+        
+      - name: Get Validation Task
+        run: |
+           if [  "${{env.validation_parameter}}" != "" ]
+           then
+                valjson='${{ toJSON( vars[env.validation_parameter] ) }}'   
+                param_file='${{env.validation_parameter}}'           
+                if [[ $valjson == null ]]
+                then
+                   echo "'(Optional) Validation Task Parameter Name Overwrite':'$param_file' is not defined in environment Validation_Task"
+                   exit 1
+                fi
+           else
+                valjson='${{ toJSON( vars[format('{0}_VALIDATION_DEFAULT', env.valtarget)] ) }}'           
+                param_file='${{ format('{0}_VALIDATION_DEFAULT', env.valtarget) }}'
+                if [[ $valjson == null ]]
+                then
+                   echo "Default Parameter $param_file is not defined in github environment 'Validation_Task'. No ${{env.valtype}} validations to be executed"
+                   exit 0
+                fi
+           fi
+           
+           echo "Using Parameter $param_file defined in environment Validation_Task"
+           echo valjson=$valjson >> $GITHUB_ENV
+           
+      - name: Get Tasks Variables
+        if: ${{ env.valjson }}
+        run: |
+           jsonname=$(echo ${{env.valtype}}val)
+           valjson_var=${{toJSON(env.valjson)}}
+           #validate preval exists
+           valjson=$(python3 -c "import sys, json;js=json.loads($valjson_var); print('$jsonname' if '$jsonname' in js else 'notdefined');") 
+           if [[ $valjson == $jsonname ]]
+           then
+              environment=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['environment'])")
+              business_service=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['business_service'])")
+              taskname=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['taskname'])")
+              parameters=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['parameters'])")
+              echo "environment=$environment" >> $GITHUB_ENV
+              echo "business_service=$business_service" >> $GITHUB_ENV
+              echo "taskname=$taskname" >> $GITHUB_ENV
+              echo "parameters=$parameters" | sed "s/\"/\\\\\"/g" >> $GITHUB_ENV
+           else
+              echo "$jsonname not defined into Validation_Task"
+           fi
+      - name: Checkout cicd-actions
+        if: ${{ env.environment }} 
+        uses: actions/checkout@v3
+        with:
+          repository: danone/onesource.cicd.actions
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          path: act
+
+      - name: Dispatch task to orchestration
+        if: ${{ env.environment }} 
+        uses: ./act/wf-dispatcher
+        with:
+          owner: danone
+          repo: adm.cicd.orchestration
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          event_type: sb-validation-execution
+          run_id: ${{ github.run_id }}
+          run_attempt: ${{env.valtype}}-${{github.run_attempt}}
+          client_payload: '{"task_name": "${{env.taskname}}","business_service": "${{env.business_service}}","environment": "${{ env.environment }}","parameters": "${{ env.parameters }}","repo": "${{ github.repository }}"}'
+        
+  databricks-deploy:
+    runs-on: ubuntu-20.04
+    needs: prevalidation_stonebranch_task
+    environment: ${{ github.event_name == 'workflow_dispatch' &&   github.ref_name  || github.base_ref }}
+    if: always() && vars['ENABLE_DATABRICKS_SYNC'] != 'false' && ( (github.event_name == 'workflow_dispatch' && needs.prevalidation_stonebranch_task.result == 'success') || (github.event_name == 'pull_request' && github.event.pull_request.merged == true) )
+    steps:      
+      - name: Checkout cicd-actions
+        uses: actions/checkout@v3
+        with:
+          repository: danone/onesource.cicd.actions
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          path: act
+
+      - name: Deployment type preparation - Manual Dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |   
+          echo UserComment=$(echo "${{ github.event.inputs.UserComment }}") >> $GITHUB_ENV
+      
+      - name: Deployment type preparation - Pull Request
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+        run: |   
+          body=$(echo "${{ github.event.pull_request.body }}" | sed -z -e 's/\n/ /g' | sed -z -e 's/\t/ /g' | sed -z -e 's/\r/ /g' | sed -z -e 's/"//g' | sed -z -e "s/'/ /g")  
+          echo "UserComment=$body" >> $GITHUB_ENV     
+ 
+      - name: Dispatch to orchestration
+        uses: ./act/wf-dispatcher
+        with:
+          owner: danone
+          repo: adm.cicd.orchestration
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          event_type: databricks-promotion
+          run_id: ${{ github.run_id }}
+          run_attempt: ${{github.run_attempt}}           
+          client_payload: |
+            {
+              "repo": "${{ github.repository }}",
+              "environment": "${{ github.ref }}",
+              "UserComment": "${{ env.UserComment }}"
+            }
+
+  postvalidation_stonebranch_task:
+    needs: [databricks-deploy, prevalidation_stonebranch_task]
+    runs-on: ubuntu-20.04
+    if:  Always() && (needs.databricks-deploy.result == 'success' ||  vars['ENABLE_DATABRICKS_SYNC'] == 'false') &&  ( (github.event_name == 'workflow_dispatch' && needs.prevalidation_stonebranch_task.result == 'success'  ) || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)    )
+    environment: Validation_Task
+    env:
+      valtype: 'post'
+      valtarget: ${{ github.event_name == 'workflow_dispatch' &&   github.ref_name  || github.base_ref }}   
+    steps:         
+      - name: Input Parameters
+        run: |
+           echo '${{ toJSON(github.event.inputs) }}'
+           validation_parameter="${{ github.event.inputs.validation_parameter }}"           
+           if [  "$validation_parameter" = "" ]
+           then
+               validation_parameter=$(echo "${{ github.event.pull_request.body }}" | python3 -c "import sys, json; str=sys.stdin.read(); print(str.split('%%')[1]) if '%%' in str else print('') " )               
+           fi
+           echo "validation_parameter=$validation_parameter"
+           echo "validation_parameter=$validation_parameter" >> $GITHUB_ENV
+        
+      - name: Get Validation Task
+        run: |
+           if [  "${{env.validation_parameter}}" != "" ]
+           then
+                valjson='${{ toJSON( vars[env.validation_parameter] ) }}'   
+                param_file='${{env.validation_parameter}}'           
+                if [[ $valjson == null ]]
+                then
+                   echo "'(Optional) Validation Task Parameter Name Overwrite':'$param_file' is not defined in environment Validation_Task"
+                   exit 1
+                fi
+           else
+                valjson='${{ toJSON( vars[format('{0}_VALIDATION_DEFAULT', env.valtarget)] ) }}'           
+                param_file='${{ format('{0}_VALIDATION_DEFAULT', env.valtarget) }}'
+                if [[ $valjson == null ]]
+                then
+                   echo "Default Parameter $param_file is not defined in github environment 'Validation_Task'. No ${{env.valtype}} validations to be executed"
+                   exit 0
+                fi
+           fi
+           
+           echo "Using Parameter $param_file defined in environment Validation_Task"
+           echo valjson=$valjson >> $GITHUB_ENV
+           
+      - name: Get Tasks Variables
+        if: ${{ env.valjson }}
+        run: |
+           jsonname=$(echo ${{env.valtype}}val)
+           valjson_var=${{toJSON(env.valjson)}}
+           #validate preval exists
+           valjson=$(python3 -c "import sys, json;js=json.loads($valjson_var); print('$jsonname' if '$jsonname' in js else 'notdefined');") 
+           if [[ $valjson == $jsonname ]]
+           then
+              environment=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['environment'])")
+              business_service=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['business_service'])")
+              taskname=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['taskname'])")
+              parameters=$(python3 -c "import sys, json; js=json.loads($valjson_var); print(js['$jsonname']['parameters'])")
+              echo "environment=$environment" >> $GITHUB_ENV
+              echo "business_service=$business_service" >> $GITHUB_ENV
+              echo "taskname=$taskname" >> $GITHUB_ENV
+              echo "parameters=$parameters" | sed "s/\"/\\\\\"/g" >> $GITHUB_ENV
+           else
+              echo "$jsonname not defined into Validation_Task"
+           fi
+      - name: Checkout cicd-actions
+        if: ${{ env.environment }} 
+        uses: actions/checkout@v3
+        with:
+          repository: danone/onesource.cicd.actions
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          path: act
+
+      - name: Dispatch task to orchestration
+        if: ${{ env.environment }} 
+        uses: ./act/wf-dispatcher
+        with:
+          owner: danone
+          repo: adm.cicd.orchestration
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          event_type: sb-validation-execution
+          run_id: ${{ github.run_id }}
+          run_attempt: ${{env.valtype}}-${{github.run_attempt}}
+          client_payload: '{"task_name": "${{env.taskname}}","business_service": "${{env.business_service}}","environment": "${{ env.environment }}","parameters": "${{ env.parameters }}","repo": "${{ github.repository }}"}'
+                    

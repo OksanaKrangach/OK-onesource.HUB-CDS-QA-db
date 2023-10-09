@@ -1,0 +1,64 @@
+name: Databricks Jobs Management
+on:
+  workflow_dispatch:           
+    inputs:    
+      db_list:
+        description: 'Get list (Jobs, Clusters and SVP)'
+        type: boolean        
+      db_create_job:
+        description: 'Create Databricks Job'
+        type: boolean                
+      db_update_job:
+        description: 'Update Databricks Job'
+        type: boolean                
+      db_delete_job:
+        description: 'Delete Databricks Job'
+        type: boolean          
+      in_svp:
+        required: false
+        description: (Required for CREATE) ServicePrinciple ID to be job owner
+        default: ''                  
+      in_filename:
+        required: false
+        description: (Required for CREATE/UPDATE) filename with json definition (under branch 'db_jobs' and path jobs/${target_environment})
+        default: ''
+      in_jobid:
+        required: false
+        description: (Required for UPDATE/DELETE) JobId to be updated/deleted
+        default: ''             
+        
+jobs:
+
+  databricks-job-mnmnt:
+    runs-on: ubuntu-20.04
+    environment: ${{github.ref_name}}
+    steps:      
+      - name: Checkout cicd-actions
+        uses: actions/checkout@v3
+        with:
+          repository: danone/onesource.cicd.actions
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          path: act
+ 
+      - name: Dispatch to orchestration
+        uses: ./act/wf-dispatcher
+        with:
+          owner: danone
+          repo: adm.cicd.orchestration
+          token: ${{ secrets.ORCHESTRATION_PAT }}
+          event_type: databricks-jobs
+          run_id: ${{ github.run_id }}
+          run_attempt: ${{github.run_attempt}}           
+          client_payload: |
+            {
+              "repo": "${{ github.repository }}",
+              "environment": "${{github.ref_name}}",
+              "flags": { "db_list": ${{ github.event.inputs.db_list }}, 
+                         "db_create_job": ${{ github.event.inputs.db_create_job }},
+                         "db_update_job": ${{ github.event.inputs.db_update_job }},
+                         "db_delete_job": ${{ github.event.inputs.db_delete_job }}
+                       },
+              "in_svp": "${{ github.event.inputs.in_svp }}",
+              "in_filename": "${{ github.event.inputs.in_filename }}",
+              "in_jobid": "${{ github.event.inputs.in_jobid }}"
+            }
